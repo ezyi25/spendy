@@ -132,6 +132,7 @@
   .tag { padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 500; }
   .tag-category { background: rgba(167,139,250,0.15); color: var(--purple); }
   .tag-payment { background: rgba(96,165,250,0.15); color: var(--blue); }
+  .tag-time { background: rgba(251,191,36,0.12); color: var(--yellow); }
   .parsed-desc { font-size: 13px; color: var(--text2); }
   .action-row { display: flex; gap: 8px; margin-top: 14px; }
   .action-btn {
@@ -474,6 +475,9 @@
   // ── AI PARSE ──
   async function parseWithAI(text) {
     const safeText = text.replace(/"/g, '\\"');
+    const now = new Date();
+    const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const currentDay = dayNames[now.getDay()];
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -482,9 +486,20 @@
         max_tokens: 1000,
         messages: [{ role: 'user', content: `Parse this expense. Return ONLY valid JSON, no markdown.
 Input: "${safeText}"
-Time: ${new Date().toISOString()}
-Format: {"amount":<number>,"currency":"EUR","description":"<2-4 words>","category":"<one of: ${CAT_LIST}>","payment":"<cash|card|transfer|other>","original":"${safeText}"}
-Rules: Extract amount as number. Default EUR. Best category. "bar"/"cash"→cash, "Karte"/"card"→card, unclear→card.` }]
+Now: ${now.toISOString()} (${currentDay})
+Format: {"amount":<number>,"currency":"EUR","description":"<2-4 words>","category":"<one of: ${CAT_LIST}>","payment":"<cash|card|transfer|other>","timestamp":"<ISO 8601>","original":"${safeText}"}
+Rules:
+- Extract amount as number. Default EUR.
+- Best category. "bar"/"cash"→cash, "Karte"/"card"→card, unclear→card.
+- TIMESTAMP: Resolve relative dates to actual ISO timestamps. Examples:
+  "gestern"/"yesterday" → yesterday's date at 12:00
+  "vorgestern" → 2 days ago at 12:00
+  "letzten Samstag"/"last Saturday" → most recent past Saturday at 12:00
+  "am Montag"/"on Monday" → most recent past Monday at 12:00
+  "letzte Woche"/"last week" → 7 days ago at 12:00
+  "heute"/"today" or no date mentioned → use Now exactly
+  Specific dates like "am 15. März" → that date at 12:00
+  Always return a valid ISO 8601 timestamp.` }]
       })
     });
     if (!res.ok) throw new Error(`API ${res.status}`);
@@ -492,7 +507,10 @@ Rules: Extract amount as number. Default EUR. Best category. "bar"/"cash"→cash
     const raw = data.content.map(c => c.text || '').join('');
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
     if (typeof parsed.amount !== 'number' || isNaN(parsed.amount)) throw new Error('Bad amount');
-    return { ...parsed, id: genId(), timestamp: new Date().toISOString() };
+    // Validate timestamp, fallback to now
+    let ts = parsed.timestamp;
+    if (!ts || isNaN(new Date(ts).getTime())) ts = now.toISOString();
+    return { ...parsed, id: genId(), timestamp: ts };
   }
 
   // ── LOCAL FALLBACK ──
@@ -514,7 +532,29 @@ Rules: Extract amount as number. Default EUR. Best category. "bar"/"cash"→cash
     else if (/rewe|edeka|lidl|aldi|supermarkt|einkauf/i.test(t)) category = 'Groceries';
     let desc = text.replace(/(\d+[.,]?\d*)\s*(€|euro|eur)?/i, '').replace(/\b(bar|cash|karte|card|kredit)\b/gi, '').trim();
     if (!desc) desc = text.slice(0, 30);
-    return { id: genId(), amount, currency: 'EUR', description: desc.slice(0, 40), category, payment, original: text, timestamp: new Date().toISOString() };
+
+    // Basic relative date parsing for fallback
+    let ts = new Date();
+    if (/\b(gestern|yesterday)\b/i.test(t)) { ts.setDate(ts.getDate() - 1); ts.setHours(12,0,0,0); }
+    else if (/\bvorgestern\b/i.test(t)) { ts.setDate(ts.getDate() - 2); ts.setHours(12,0,0,0); }
+    else if (/\bletzte\s*woche\b|\blast\s*week\b/i.test(t)) { ts.setDate(ts.getDate() - 7); ts.setHours(12,0,0,0); }
+    else if (/\bletzten?\s*(montag|monday)\b/i.test(t)) { ts = getLastDayOfWeek(1); }
+    else if (/\bletzten?\s*(dienstag|tuesday)\b/i.test(t)) { ts = getLastDayOfWeek(2); }
+    else if (/\bletzten?\s*(mittwoch|wednesday)\b/i.test(t)) { ts = getLastDayOfWeek(3); }
+    else if (/\bletzten?\s*(donnerstag|thursday)\b/i.test(t)) { ts = getLastDayOfWeek(4); }
+    else if (/\bletzten?\s*(freitag|friday)\b/i.test(t)) { ts = getLastDayOfWeek(5); }
+    else if (/\bletzten?\s*(samstag|saturday)\b/i.test(t)) { ts = getLastDayOfWeek(6); }
+    else if (/\bletzten?\s*(sonntag|sunday)\b/i.test(t)) { ts = getLastDayOfWeek(0); }
+
+    return { id: genId(), amount, currency: 'EUR', description: desc.slice(0, 40), category, payment, original: text, timestamp: ts.toISOString() };
+  }
+
+  function getLastDayOfWeek(dayIndex) {
+    const d = new Date();
+    const diff = (d.getDay() - dayIndex + 7) % 7 || 7;
+    d.setDate(d.getDate() - diff);
+    d.setHours(12, 0, 0, 0);
+    return d;
   }
 
   function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
@@ -523,7 +563,14 @@ Rules: Extract amount as number. Default EUR. Best category. "bar"/"cash"→cash
   function showParsedResult(p) {
     const cat = CATEGORIES[p.category] || CATEGORIES['Other'];
     $('#parsed-amount').textContent = `€${p.amount.toFixed(2)}`;
-    $('#parsed-tags').innerHTML = `<span class="tag tag-category">${cat.icon} ${p.category}</span><span class="tag tag-payment">💳 ${p.payment}</span>`;
+
+    // Show date tag if not today
+    const expDate = new Date(p.timestamp);
+    const today = new Date();
+    const isToday = expDate.toDateString() === today.toDateString();
+    const dateTag = isToday ? '' : `<span class="tag tag-time">${expDate.toLocaleDateString('de-DE', { weekday: 'short', day: 'numeric', month: 'short' })}</span>`;
+
+    $('#parsed-tags').innerHTML = `<span class="tag tag-category">${cat.icon} ${p.category}</span><span class="tag tag-payment">💳 ${p.payment}</span>${dateTag}`;
     $('#parsed-desc').textContent = p.description;
     $('#parsed-result').classList.add('visible');
     inputEl.value = '';
